@@ -32,7 +32,6 @@ bool PipeIPC::createPipes() {
 
 void PipeIPC::setupParent() {
     _isParent = true;
-    // Parent writes to child, reads from child
     if (_parentToChildRead != -1) {
         ::close(_parentToChildRead);
         _parentToChildRead = -1;
@@ -45,7 +44,6 @@ void PipeIPC::setupParent() {
 
 void PipeIPC::setupChild() {
     _isParent = false;
-    // Child reads from parent, writes to parent
     if (_parentToChildWrite != -1) {
         ::close(_parentToChildWrite);
         _parentToChildWrite = -1;
@@ -68,12 +66,10 @@ bool PipeIPC::send(const std::string& message) {
     
     uint32_t length = message.length();
     
-    // Send length first
     if (!writeData(writeFd, &length, sizeof(length))) {
         return false;
     }
     
-    // Send message
     if (!writeData(writeFd, message.c_str(), length)) {
         return false;
     }
@@ -91,28 +87,22 @@ std::string PipeIPC::receive() {
         return "";
     }
     
-    // Make the read non-blocking
     int flags = fcntl(readFd, F_GETFL, 0);
     fcntl(readFd, F_SETFL, flags | O_NONBLOCK);
     
     uint32_t length;
     
-    // Read length first
     if (!readData(readFd, &length, sizeof(length))) {
-        // Restore blocking mode
         fcntl(readFd, F_SETFL, flags);
         return "";
     }
     
-    // Read message
     std::string message(length, '\0');
     if (!readData(readFd, &message[0], length)) {
-        // Restore blocking mode
         fcntl(readFd, F_SETFL, flags);
         return "";
     }
     
-    // Restore blocking mode
     fcntl(readFd, F_SETFL, flags);
     
     return message;
@@ -205,13 +195,12 @@ bool PipeIPC::readData(int fd, void* data, size_t size) {
         ssize_t result = read(fd, ptr + bytesRead, size - bytesRead);
         if (result == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No data available right now (non-blocking mode)
                 return false;
             }
             return false;
         }
         if (result == 0) {
-            return false; // EOF
+            return false;
         }
         bytesRead += result;
     }

@@ -22,14 +22,11 @@ KitchenManager::~KitchenManager() {
 bool KitchenManager::distributePizza(const SerializedPizza& pizza) {
     ScopedLock lock(_kitchensMutex);
     
-    // Clean up dead kitchens first
     cleanupDeadKitchens();
     
-    // Find the best kitchen for load balancing
     int bestKitchenIndex = findBestKitchen();
     
     if (bestKitchenIndex == -1) {
-        // No suitable kitchen found, create a new one
         createNewKitchen();
         bestKitchenIndex = _kitchens.size() - 1;
     }
@@ -37,20 +34,27 @@ bool KitchenManager::distributePizza(const SerializedPizza& pizza) {
     if (bestKitchenIndex >= 0 && bestKitchenIndex < static_cast<int>(_kitchens.size())) {
         auto& kitchenProcess = _kitchens[bestKitchenIndex];
         
-        // Check if kitchen can accept the pizza
-        if (!kitchenProcess->kitchen->addPizza(pizza)) {
-            return false;
+        if (!kitchenProcess->kitchen->canAcceptPizza()) {
+            createNewKitchen();
+            bestKitchenIndex = _kitchens.size() - 1;
+            if (bestKitchenIndex < 0 || bestKitchenIndex >= static_cast<int>(_kitchens.size())) {
+                return false;
+            }
         }
         
-        // Send pizza via IPC
-        if (kitchenProcess->ipc && kitchenProcess->ipc->isReady()) {
+        auto& finalKitchenProcess = _kitchens[bestKitchenIndex];
+        
+        if (finalKitchenProcess->ipc && finalKitchenProcess->ipc->isReady()) {
             try {
-                bool success = kitchenProcess->ipc->send("PIZZA:" + pizza.pack());
+                bool success = finalKitchenProcess->ipc->send("PIZZA:" + pizza.pack());
                 if (success) {
-                    LOG_INFO("Distributed pizza to kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
+                    finalKitchenProcess->kitchen->incrementPendingPizzas();
+                    finalKitchenProcess->kitchen->updateLastActivity();
+                    
+                    LOG_INFO("Distributed pizza to kitchen " + std::to_string(finalKitchenProcess->kitchen->getId()));
                     return true;
                 } else {
-                    LOG_ERROR("Failed to send pizza via IPC to kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
+                    LOG_ERROR("Failed to send pizza via IPC to kitchen " + std::to_string(finalKitchenProcess->kitchen->getId()));
                 }
             } catch (const std::exception& e) {
                 LOG_ERROR("Failed to distribute pizza: " + std::string(e.what()));
@@ -72,7 +76,6 @@ void KitchenManager::createNewKitchen() {
     
     int kitchenId = kitchen->getId();
     
-    // Fork the kitchen process
     pid_t pid = fork();
     
     if (pid == -1) {
@@ -80,10 +83,8 @@ void KitchenManager::createNewKitchen() {
     }
     
     if (pid == 0) {
-        // Child process - run the kitchen
-        // Configure separate logging for child process
         Logger& logger = Logger::getInstance();
-        logger.enableConsoleOutput(false); // No console output for child
+        logger.enableConsoleOutput(false);
         logger.enableFileOutput("kitchen_" + std::to_string(kitchenId) + ".log");
         
         ipc->setupChild();
@@ -91,9 +92,8 @@ void KitchenManager::createNewKitchen() {
         kitchen->runAsChildProcess();
         exit(0);
     } else {
-        // Parent process - manage the kitchen
         ipc->setupParent();
-        kitchen->start(); // Minimal setup in parent
+        kitchen->start();
         
         auto kitchenProcess = std::make_unique<KitchenProcess>(
             std::move(kitchen), std::move(ipc), pid);
@@ -103,7 +103,6 @@ void KitchenManager::createNewKitchen() {
         LOG_INFO("Created new kitchen " + std::to_string(kitchenId) + 
                  " with PID " + std::to_string(pid));
         
-        // Give the child process time to initialize
         Timer::sleep(100);
     }
 }
@@ -114,35 +113,29 @@ void KitchenManager::closeInactiveKitchens() {
     for (auto it = _kitchens.begin(); it != _kitchens.end();) {
         auto& kitchenProcess = *it;
         
-        // Check if child process is still alive first
         int status;
         pid_t result = waitpid(kitchenProcess->pid, &status, WNOHANG);
         
         if (result == kitchenProcess->pid) {
-            // Child has already terminated
             LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + 
                      " process already terminated");
             it = _kitchens.erase(it);
             continue;
         }
         
-        // Check if kitchen should close (inactive for too long)
         if (kitchenProcess->kitchen->shouldClose()) {
             LOG_INFO("Closing inactive kitchen " + 
                      std::to_string(kitchenProcess->kitchen->getId()));
             
-            // Send termination signal to child process
             if (kill(kitchenProcess->pid, SIGTERM) == 0) {
-                // Wait for child to terminate with timeout
-                for (int i = 0; i < 10; ++i) {  // Wait up to 1 second
+                for (int i = 0; i < 10; ++i) {
                     result = waitpid(kitchenProcess->pid, &status, WNOHANG);
                     if (result == kitchenProcess->pid) {
                         break;
                     }
-                    usleep(100000);  // Sleep 100ms
+                    usleep(100000);
                 }
                 
-                // Force kill if still alive
                 if (result != kitchenProcess->pid) {
                     kill(kitchenProcess->pid, SIGKILL);
                     waitpid(kitchenProcess->pid, &status, 0);
@@ -164,23 +157,22 @@ void KitchenManager::displayStatus() const {
     
     if (_kitchens.empty()) {
         std::cout << "No active kitchens" << std::endl;
+        std::cout << "=====================" << std::endl;
         return;
     }
     
     for (const auto& kitchenProcess : _kitchens) {
         if (!kitchenProcess->active) continue;
         
-        // Request fresh status from child process
         KitchenStatus status;
+        bool gotRealStatus = false;
+        
         if (kitchenProcess->ipc && kitchenProcess->ipc->isReady()) {
             try {
-                // Send status request
                 if (kitchenProcess->ipc->send("STATUS_REQUEST")) {
                     LOG_INFO("Sent STATUS_REQUEST to kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
                     
-                    // Wait for response with longer timeout
-                    bool gotResponse = false;
-                    for (int i = 0; i < 50; ++i) { // Wait up to 500ms
+                    for (int i = 0; i < 100; ++i) {
                         std::string response = kitchenProcess->ipc->receive();
                         if (!response.empty()) {
                             LOG_INFO("Received response from kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + ": " + 
@@ -188,7 +180,7 @@ void KitchenManager::displayStatus() const {
                             
                             if (response.substr(0, 7) == "STATUS:") {
                                 status.unpack(response.substr(7));
-                                gotResponse = true;
+                                gotRealStatus = true;
                                 LOG_INFO("Successfully parsed status from kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
                                 break;
                             }
@@ -196,25 +188,28 @@ void KitchenManager::displayStatus() const {
                         Timer::sleep(10);
                     }
                     
-                    if (!gotResponse) {
+                    if (!gotRealStatus) {
                         LOG_WARNING("No response from kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + ", using fallback");
-                        // Fallback to parent's simulated status
-                        status = kitchenProcess->kitchen->getStatus();
                     }
                 } else {
                     LOG_ERROR("Failed to send STATUS_REQUEST to kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
-                    status = kitchenProcess->kitchen->getStatus();
                 }
                 
             } catch (const std::exception& e) {
-                // Fallback to parent's simulated status
-                status = kitchenProcess->kitchen->getStatus();
                 LOG_ERROR("Failed to get real status from kitchen " + 
                          std::to_string(kitchenProcess->kitchen->getId()) + ": " + e.what());
             }
         } else {
-            status = kitchenProcess->kitchen->getStatus();
             LOG_WARNING("IPC not ready for kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
+        }
+        
+        if (!gotRealStatus) {
+            status.kitchenId = kitchenProcess->kitchen->getId();
+            status.activeCooks = 0;
+            status.totalCooks = _numCooksPerKitchen;
+            status.pizzasInQueue = 0;
+            status.maxCapacity = 2 * _numCooksPerKitchen;
+            status.ingredients = {5, 5, 5, 5, 5, 5, 5, 5, 5};
         }
         
         std::cout << "\nKitchen " << status.kitchenId << " (PID: " << kitchenProcess->pid << "):" << std::endl;
@@ -260,10 +255,8 @@ void KitchenManager::cleanup() {
     
     for (auto& kitchenProcess : _kitchens) {
         if (kitchenProcess->active) {
-            // Send termination signal
             kill(kitchenProcess->pid, SIGTERM);
             
-            // Wait for child to terminate
             int status;
             waitpid(kitchenProcess->pid, &status, 0);
             
@@ -290,20 +283,31 @@ int KitchenManager::findBestKitchen() const {
             continue;
         }
         
-        KitchenStatus status = kitchenProcess->kitchen->getStatus();
-        
-        // Can't accept more pizzas
-        if (status.pizzasInQueue >= status.maxCapacity) {
+        if (!kitchenProcess->kitchen->canAcceptPizza()) {
+            LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + " is at capacity");
             continue;
         }
         
-        // Calculate load (pizzas in queue + active cooks)
-        int load = status.pizzasInQueue + status.activeCooks;
+        int load = kitchenProcess->kitchen->getPendingPizzaCount();
+        
+        LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + 
+                 " has load: " + std::to_string(load));
         
         if (load < minLoad) {
             minLoad = load;
             bestIndex = static_cast<int>(i);
         }
+        
+        if (load == 0) {
+            break;
+        }
+    }
+    
+    if (bestIndex != -1) {
+        LOG_INFO("Selected kitchen " + std::to_string(_kitchens[bestIndex]->kitchen->getId()) + 
+                 " with load " + std::to_string(minLoad));
+    } else {
+        LOG_INFO("No kitchen can accept more pizzas");
     }
     
     return bestIndex;
@@ -313,12 +317,10 @@ void KitchenManager::cleanupDeadKitchens() {
     for (auto it = _kitchens.begin(); it != _kitchens.end();) {
         auto& kitchenProcess = *it;
         
-        // Check if child process is still alive
         int status;
         pid_t result = waitpid(kitchenProcess->pid, &status, WNOHANG);
         
         if (result == kitchenProcess->pid) {
-            // Child has terminated
             LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + 
                      " process terminated");
             it = _kitchens.erase(it);

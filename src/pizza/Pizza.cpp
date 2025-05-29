@@ -47,10 +47,9 @@ void Pizza::initializeIngredients() {
 
 void Pizza::calculateCookingTime(double multiplier) {
     int baseTime = PizzaTypeHelper::getCookingTime(_type);
-    _cookingTime = static_cast<int>(baseTime * 1000 * multiplier); // Convert to milliseconds
+    _cookingTime = static_cast<int>(baseTime * 1000 * multiplier);
 }
 
-// Implementation of PizzaTypeHelper
 std::string PizzaTypeHelper::pizzaTypeToString(PizzaType type) {
     switch (type) {
         case Regina: return "Regina";

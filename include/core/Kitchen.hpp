@@ -29,6 +29,7 @@ private:
     std::unique_ptr<PipeIPC> _ipc;
     std::atomic<bool> _active;
     std::atomic<int> _activeCooks;
+    std::atomic<int> _pendingPizzas;
     
     Timer _lastActivityTimer;
     std::thread _restockThread;
@@ -53,8 +54,12 @@ public:
     
     void setIPC(std::unique_ptr<PipeIPC> ipc);
     
-    // For child process
     void runAsChildProcess();
+    
+    void incrementPendingPizzas();
+    void decrementPendingPizzas();
+    int getPendingPizzaCount() const;
+    void decrementQueueSize();
 
 private:
     void cookPizza(const SerializedPizza& pizza);

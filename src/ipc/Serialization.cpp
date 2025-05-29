@@ -29,7 +29,7 @@ void SerializedPizza::unpack(const std::string& data) {
 KitchenStatus::KitchenStatus(int id, int active, int total, int queue, int capacity)
     : kitchenId(id), activeCooks(active), totalCooks(total), 
       pizzasInQueue(queue), maxCapacity(capacity) {
-    ingredients.resize(9, 5); // 9 types of ingredients, start with 5 each
+    ingredients.resize(9, 5);
 }
 
 std::string KitchenStatus::pack() const {

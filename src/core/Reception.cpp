@@ -22,7 +22,6 @@ void Reception::run() {
     displayWelcome();
     showHelp();
     
-    // Handle Ctrl+C gracefully
     signal(SIGINT, [](int) {
         std::cout << "\nShutting down Plazza..." << std::endl;
         exit(0);
@@ -49,9 +48,8 @@ void Reception::run() {
             LOG_ERROR(e.what());
         }
         
-        // Clean up inactive kitchens periodically (but not too aggressively)
         static int cleanupCounter = 0;
-        if (++cleanupCounter >= 10) { // Only check every 10 commands
+        if (++cleanupCounter >= 10) {
             _kitchenManager->closeInactiveKitchens();
             cleanupCounter = 0;
         }
@@ -70,7 +68,6 @@ void Reception::stop() {
 void Reception::processCommand(const std::string& command) {
     std::string trimmed = command;
     
-    // Remove leading/trailing whitespace
     size_t start = trimmed.find_first_not_of(" \t");
     if (start == std::string::npos) {
         return;
@@ -79,7 +76,6 @@ void Reception::processCommand(const std::string& command) {
     size_t end = trimmed.find_last_not_of(" \t");
     trimmed = trimmed.substr(start, end - start + 1);
     
-    // Check for special commands
     if (trimmed == "status") {
         handleStatusCommand();
     } else if (trimmed == "help") {
@@ -87,7 +83,6 @@ void Reception::processCommand(const std::string& command) {
     } else if (trimmed == "quit" || trimmed == "exit") {
         _running = false;
     } else {
-        // Assume it's a pizza order
         handleOrderCommand(trimmed);
     }
 }
@@ -108,7 +103,6 @@ void Reception::handleOrderCommand(const std::string& command) {
         
         std::cout << "Processing " << totalPizzas << " pizza(s)..." << std::endl;
         
-        // Process each pizza individually for load balancing
         for (const auto& order : orders) {
             for (int i = 0; i < order.quantity; ++i) {
                 SerializedPizza pizza(order.type, order.size, 
@@ -127,10 +121,8 @@ void Reception::handleOrderCommand(const std::string& command) {
             }
         }
         
-        // Small delay to let child processes initialize and show their logs
         Timer::sleep(200);
         
-        // Clear any mixed output and show a fresh prompt indicator
         std::cout << std::endl;
         
     } catch (const ParsingException& e) {

@@ -48,7 +48,6 @@ private:
     std::string levelToString(LogLevel level);
 };
 
-// Convenience macros
 #define LOG_DEBUG(msg) Logger::getInstance().debug(msg)
 #define LOG_INFO(msg) Logger::getInstance().info(msg)
 #define LOG_WARNING(msg) Logger::getInstance().warning(msg)

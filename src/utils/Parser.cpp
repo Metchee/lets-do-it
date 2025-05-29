@@ -8,21 +8,18 @@
 std::vector<PizzaOrder> Parser::parseOrderCommand(const std::string& command) {
     std::vector<PizzaOrder> orders;
     
-    // Remove comments (everything after #)
     std::string cleanCommand = command;
     size_t commentPos = cleanCommand.find('#');
     if (commentPos != std::string::npos) {
         cleanCommand = cleanCommand.substr(0, commentPos);
     }
     
-    // Trim the cleaned command
     cleanCommand = trim(cleanCommand);
     
     if (!isValidCommand(cleanCommand)) {
         throw ParsingException("Invalid command format");
     }
     
-    // Split by semicolon
     std::vector<std::string> orderStrings = tokenize(cleanCommand);
     
     for (const std::string& orderStr : orderStrings) {
@@ -53,7 +50,6 @@ bool Parser::isValidCommand(const std::string& command) {
         return false;
     }
     
-    // Basic regex for the grammar: TYPE SIZE NUMBER [; TYPE SIZE NUMBER]*
     std::regex pattern(R"(^[a-zA-Z]+\s+(S|M|L|XL|XXL)\s+x[1-9][0-9]*(\s*;\s*[a-zA-Z]+\s+(S|M|L|XL|XXL)\s+x[1-9][0-9]*)*$)");
     return std::regex_match(command, pattern);
 }

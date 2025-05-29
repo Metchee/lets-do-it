@@ -18,7 +18,6 @@ void printUsage() {
 }
 
 int main(int argc, char* argv[]) {
-    // Setup signal handlers
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
     
@@ -37,7 +36,6 @@ int main(int argc, char* argv[]) {
             return 84;
         }
         
-        // Initialize logger
         Logger& logger = Logger::getInstance();
         logger.enableConsoleOutput(true);
         logger.enableFileOutput("plazza.log");
