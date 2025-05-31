@@ -11,6 +11,8 @@
 #include <map>
 #include <memory>
 #include <atomic>
+#include <thread>
+#include <vector>
 
 class Kitchen : public IKitchen {
 private:
@@ -53,7 +55,6 @@ public:
     bool shouldClose() const override;
     
     void setIPC(std::unique_ptr<PipeIPC> ipc);
-    
     void runAsChildProcess();
     
     void incrementPendingPizzas();
@@ -62,13 +63,28 @@ public:
     void decrementQueueSize();
 
 private:
+    void initializeKitchenProcess();
+    void startRestockThread();
+    void cleanupKitchenProcess();
+    
+    void runMainProcessLoop();
+    bool processIncomingMessages();
+    void processPizzaQueue();
+    void sendPeriodicStatus(int loopCount);
+    
+    bool handlePizzaMessage(const std::string& message);
+    bool handleStatusMessage(const std::string& message);
+    
     void cookPizza(const SerializedPizza& pizza);
+    void removePizzaFromQueue();
+    
     void restockIngredients();
-    void communicateWithReception();
+    void restockLoop();
     bool hasIngredients(const SerializedPizza& pizza);
     void consumeIngredients(const SerializedPizza& pizza);
     void initializeIngredients();
-    void restockLoop();
+    
+    void communicateWithReception();
 };
 
 #endif

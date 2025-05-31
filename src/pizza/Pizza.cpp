@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+
 Pizza::Pizza(PizzaType type, PizzaSize size, double multiplier)
     : _type(type), _size(size), _cooked(false) {
     initializeIngredients();
@@ -114,7 +115,7 @@ std::vector<Ingredient> PizzaTypeHelper::getIngredientsForPizza(PizzaType type) 
 int PizzaTypeHelper::getCookingTime(PizzaType type) {
     switch (type) {
         case Margarita: return 1;
-        case Regina: return 2;
+        case Regina: return 2;  
         case Americana: return 2;
         case Fantasia: return 4;
         default: return 1;

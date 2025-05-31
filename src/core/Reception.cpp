@@ -38,6 +38,7 @@ void Reception::run() {
         }
         
         if (input.empty()) {
+            _kitchenManager->checkForCompletedPizzas();
             continue;
         }
         
@@ -48,14 +49,14 @@ void Reception::run() {
             LOG_ERROR(e.what());
         }
         
+        _kitchenManager->checkForCompletedPizzas();
+        
         static int cleanupCounter = 0;
         if (++cleanupCounter >= 10) {
             _kitchenManager->closeInactiveKitchens();
             cleanupCounter = 0;
         }
     }
-    
-    LOG_INFO("Reception shutting down");
 }
 
 void Reception::stop() {
@@ -106,14 +107,13 @@ void Reception::handleOrderCommand(const std::string& command) {
         for (const auto& order : orders) {
             for (int i = 0; i < order.quantity; ++i) {
                 SerializedPizza pizza(order.type, order.size, 
-                                    PizzaTypeHelper::getCookingTime(order.type) * _multiplier * 1000);
+                    static_cast<int>(PizzaTypeHelper::getCookingTime(order.type) * _multiplier));
                 
                 std::string pizzaName = PizzaTypeHelper::pizzaTypeToString(order.type) + " " +
                                       PizzaTypeHelper::pizzaSizeToString(order.size);
                 
                 if (_kitchenManager->distributePizza(pizza)) {
                     std::cout << "Ordered: " << pizzaName << std::endl;
-                    LOG_INFO("Pizza ordered: " + pizzaName);
                 } else {
                     std::cout << "Failed to order: " << pizzaName << " (no available kitchen)" << std::endl;
                     LOG_ERROR("Failed to order pizza: " + pizzaName);
@@ -122,7 +122,6 @@ void Reception::handleOrderCommand(const std::string& command) {
         }
         
         Timer::sleep(200);
-        
         std::cout << std::endl;
         
     } catch (const ParsingException& e) {

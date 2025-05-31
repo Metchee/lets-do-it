@@ -23,6 +23,7 @@ bool KitchenManager::distributePizza(const SerializedPizza& pizza) {
     ScopedLock lock(_kitchensMutex);
     
     cleanupDeadKitchens();
+    checkForCompletedPizzas();
     
     int bestKitchenIndex = findBestKitchen();
     
@@ -31,35 +32,43 @@ bool KitchenManager::distributePizza(const SerializedPizza& pizza) {
         bestKitchenIndex = _kitchens.size() - 1;
     }
     
-    if (bestKitchenIndex >= 0 && bestKitchenIndex < static_cast<int>(_kitchens.size())) {
-        auto& kitchenProcess = _kitchens[bestKitchenIndex];
-        
-        if (!kitchenProcess->kitchen->canAcceptPizza()) {
-            createNewKitchen();
-            bestKitchenIndex = _kitchens.size() - 1;
-            if (bestKitchenIndex < 0 || bestKitchenIndex >= static_cast<int>(_kitchens.size())) {
-                return false;
-            }
+    return sendPizzaToKitchen(bestKitchenIndex, pizza);
+}
+
+bool KitchenManager::sendPizzaToKitchen(int kitchenIndex, const SerializedPizza& pizza) {
+    if (kitchenIndex < 0 || kitchenIndex >= static_cast<int>(_kitchens.size())) {
+        return false;
+    }
+    
+    auto& kitchenProcess = _kitchens[kitchenIndex];
+    
+    if (!kitchenProcess->kitchen->canAcceptPizza()) {
+        createNewKitchen();
+        kitchenIndex = _kitchens.size() - 1;
+        if (kitchenIndex < 0 || kitchenIndex >= static_cast<int>(_kitchens.size())) {
+            return false;
         }
-        
-        auto& finalKitchenProcess = _kitchens[bestKitchenIndex];
-        
-        if (finalKitchenProcess->ipc && finalKitchenProcess->ipc->isReady()) {
-            try {
-                bool success = finalKitchenProcess->ipc->send("PIZZA:" + pizza.pack());
-                if (success) {
-                    finalKitchenProcess->kitchen->incrementPendingPizzas();
-                    finalKitchenProcess->kitchen->updateLastActivity();
-                    
-                    LOG_INFO("Distributed pizza to kitchen " + std::to_string(finalKitchenProcess->kitchen->getId()));
-                    return true;
-                } else {
-                    LOG_ERROR("Failed to send pizza via IPC to kitchen " + std::to_string(finalKitchenProcess->kitchen->getId()));
-                }
-            } catch (const std::exception& e) {
-                LOG_ERROR("Failed to distribute pizza: " + std::string(e.what()));
-            }
+    }
+    
+    return sendPizzaViaIPC(_kitchens[kitchenIndex].get(), pizza);
+}
+
+bool KitchenManager::sendPizzaViaIPC(KitchenProcess* kitchenProcess, const SerializedPizza& pizza) {
+    if (!kitchenProcess->ipc || !kitchenProcess->ipc->isReady()) {
+        return false;
+    }
+    
+    try {
+        if (kitchenProcess->ipc->send("PIZZA:" + pizza.pack())) {
+            kitchenProcess->kitchen->incrementPendingPizzas();
+            kitchenProcess->kitchen->updateLastActivity();
+            return true;
+        } else {
+            LOG_ERROR("Failed to send pizza via IPC to kitchen " + 
+                     std::to_string(kitchenProcess->kitchen->getId()));
         }
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to distribute pizza: " + std::string(e.what()));
     }
     
     return false;
@@ -75,7 +84,13 @@ void KitchenManager::createNewKitchen() {
     }
     
     int kitchenId = kitchen->getId();
+    forkKitchenProcess(std::move(kitchen), std::move(ipc), kitchenId);
     
+    Timer::sleep(100);
+}
+
+pid_t KitchenManager::forkKitchenProcess(std::unique_ptr<Kitchen> kitchen, 
+                                        std::unique_ptr<PipeIPC> ipc, int kitchenId) {
     pid_t pid = fork();
     
     if (pid == -1) {
@@ -83,65 +98,43 @@ void KitchenManager::createNewKitchen() {
     }
     
     if (pid == 0) {
-        Logger& logger = Logger::getInstance();
-        logger.enableConsoleOutput(false);
-        logger.enableFileOutput("kitchen_" + std::to_string(kitchenId) + ".log");
-        
-        ipc->setupChild();
-        kitchen->setIPC(std::move(ipc));
-        kitchen->runAsChildProcess();
+        setupChildProcess(std::move(kitchen), std::move(ipc), kitchenId);
         exit(0);
     } else {
-        ipc->setupParent();
-        kitchen->start();
-        
-        auto kitchenProcess = std::make_unique<KitchenProcess>(
-            std::move(kitchen), std::move(ipc), pid);
-        
-        _kitchens.push_back(std::move(kitchenProcess));
-        
-        LOG_INFO("Created new kitchen " + std::to_string(kitchenId) + 
-                 " with PID " + std::to_string(pid));
-        
-        Timer::sleep(100);
+        setupParentProcess(std::move(kitchen), std::move(ipc), pid);
     }
+    
+    return pid;
+}
+
+void KitchenManager::setupChildProcess(std::unique_ptr<Kitchen> kitchen, 
+                                      std::unique_ptr<PipeIPC> ipc, int kitchenId) {
+    Logger& logger = Logger::getInstance();
+    logger.enableConsoleOutput(false);
+    logger.enableFileOutput("kitchen_" + std::to_string(kitchenId) + ".log");
+    
+    ipc->setupChild();
+    kitchen->setIPC(std::move(ipc));
+    kitchen->runAsChildProcess();
+}
+
+void KitchenManager::setupParentProcess(std::unique_ptr<Kitchen> kitchen, 
+                                       std::unique_ptr<PipeIPC> ipc, pid_t pid) {
+    ipc->setupParent();
+    kitchen->start();
+    
+    auto kitchenProcess = std::make_unique<KitchenProcess>(
+        std::move(kitchen), std::move(ipc), pid);
+    
+    _kitchens.push_back(std::move(kitchenProcess));
 }
 
 void KitchenManager::closeInactiveKitchens() {
     ScopedLock lock(_kitchensMutex);
     
     for (auto it = _kitchens.begin(); it != _kitchens.end();) {
-        auto& kitchenProcess = *it;
-        
-        int status;
-        pid_t result = waitpid(kitchenProcess->pid, &status, WNOHANG);
-        
-        if (result == kitchenProcess->pid) {
-            LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + 
-                     " process already terminated");
-            it = _kitchens.erase(it);
-            continue;
-        }
-        
-        if (kitchenProcess->kitchen->shouldClose()) {
-            LOG_INFO("Closing inactive kitchen " + 
-                     std::to_string(kitchenProcess->kitchen->getId()));
-            
-            if (kill(kitchenProcess->pid, SIGTERM) == 0) {
-                for (int i = 0; i < 10; ++i) {
-                    result = waitpid(kitchenProcess->pid, &status, WNOHANG);
-                    if (result == kitchenProcess->pid) {
-                        break;
-                    }
-                    usleep(100000);
-                }
-                
-                if (result != kitchenProcess->pid) {
-                    kill(kitchenProcess->pid, SIGKILL);
-                    waitpid(kitchenProcess->pid, &status, 0);
-                }
-            }
-            
+        if (shouldCloseKitchen(*it)) {
+            terminateKitchenProcess(*it);
             it = _kitchens.erase(it);
         } else {
             ++it;
@@ -149,85 +142,217 @@ void KitchenManager::closeInactiveKitchens() {
     }
 }
 
+bool KitchenManager::shouldCloseKitchen(const std::unique_ptr<KitchenProcess>& kitchenProcess) {
+    int status;
+    pid_t result = waitpid(kitchenProcess->pid, &status, WNOHANG);
+    
+    if (result == kitchenProcess->pid) {
+        return true;
+    }
+    
+    return kitchenProcess->kitchen->shouldClose();
+}
+
+void KitchenManager::terminateKitchenProcess(const std::unique_ptr<KitchenProcess>& kitchenProcess) {
+    if (kill(kitchenProcess->pid, SIGTERM) == 0) {
+        waitForKitchenTermination(kitchenProcess->pid);
+    }
+}
+
+void KitchenManager::waitForKitchenTermination(pid_t pid) {
+    int status;
+    
+    for (int i = 0; i < 10; ++i) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            return;
+        }
+        usleep(100000);
+    }
+    
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+}
+
+void KitchenManager::checkForCompletedPizzas() {
+    for (const auto& kitchenProcess : _kitchens) {
+        if (!isKitchenReady(kitchenProcess.get())) {
+            continue;
+        }
+        
+        processKitchenMessages(kitchenProcess.get());
+    }
+}
+
+bool KitchenManager::isKitchenReady(KitchenProcess* kitchenProcess) const {
+    return kitchenProcess->active && 
+           kitchenProcess->ipc && 
+           kitchenProcess->ipc->isReady();
+}
+
+void KitchenManager::processKitchenMessages(KitchenProcess* kitchenProcess) {
+    for (int i = 0; i < 20; ++i) {
+        std::string message = receiveKitchenMessage(kitchenProcess);
+        if (message.empty()) {
+            break;
+        }
+        
+        handleKitchenMessage(message, kitchenProcess->kitchen->getId());
+    }
+}
+
+std::string KitchenManager::receiveKitchenMessage(KitchenProcess* kitchenProcess) const {
+    try {
+        return kitchenProcess->ipc->receive();
+    } catch (const std::exception& e) {
+        return "";
+    }
+}
+
+void KitchenManager::handleKitchenMessage(const std::string& message, int kitchenId) {
+    if (message.substr(0, 10) == "COMPLETED:") {
+        handleCompletedPizza(message.substr(10), kitchenId);
+    }
+}
+
+void KitchenManager::handleCompletedPizza(const std::string& pizzaData, int kitchenId) {
+    try {
+        SerializedPizza completedPizza;
+        completedPizza.unpack(pizzaData);
+        
+        std::string pizzaInfo = PizzaTypeHelper::pizzaTypeToString(completedPizza.type) + " " +
+                               PizzaTypeHelper::pizzaSizeToString(completedPizza.size);
+        
+        std::cout << "🍕 Pizza ready: " << pizzaInfo << " (Kitchen " << kitchenId << ")" << std::endl;
+        
+        LOG_INFO("Pizza ready: " + pizzaInfo);
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to process completed pizza from kitchen " + 
+                 std::to_string(kitchenId) + ": " + e.what());
+    }
+}
+
 void KitchenManager::displayStatus() const {
     ScopedLock lock(const_cast<Mutex&>(_kitchensMutex));
     
-    std::cout << "\n=== KITCHEN STATUS ===" << std::endl;
-    std::cout << "Total kitchens: " << _kitchens.size() << std::endl;
+    const_cast<KitchenManager*>(this)->checkForCompletedPizzas();
+    
+    displayStatusHeader();
     
     if (_kitchens.empty()) {
-        std::cout << "No active kitchens" << std::endl;
-        std::cout << "=====================" << std::endl;
+        displayNoKitchensMessage();
         return;
     }
     
+    displayAllKitchens();
+    displayStatusFooter();
+}
+
+void KitchenManager::displayStatusHeader() const {
+    std::cout << "\n=== KITCHEN STATUS ===" << std::endl;
+    std::cout << "Total kitchens: " << _kitchens.size() << std::endl;
+}
+
+void KitchenManager::displayNoKitchensMessage() const {
+    std::cout << "No active kitchens" << std::endl;
+    std::cout << "=====================" << std::endl;
+}
+
+void KitchenManager::displayAllKitchens() const {
     for (const auto& kitchenProcess : _kitchens) {
-        if (!kitchenProcess->active) continue;
-        
-        KitchenStatus status;
-        bool gotRealStatus = false;
-        
-        if (kitchenProcess->ipc && kitchenProcess->ipc->isReady()) {
-            try {
-                if (kitchenProcess->ipc->send("STATUS_REQUEST")) {
-                    LOG_INFO("Sent STATUS_REQUEST to kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
-                    
-                    for (int i = 0; i < 100; ++i) {
-                        std::string response = kitchenProcess->ipc->receive();
-                        if (!response.empty()) {
-                            LOG_INFO("Received response from kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + ": " + 
-                                    (response.length() > 100 ? response.substr(0, 100) + "..." : response));
-                            
-                            if (response.substr(0, 7) == "STATUS:") {
-                                status.unpack(response.substr(7));
-                                gotRealStatus = true;
-                                LOG_INFO("Successfully parsed status from kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
-                                break;
-                            }
-                        }
-                        Timer::sleep(10);
-                    }
-                    
-                    if (!gotRealStatus) {
-                        LOG_WARNING("No response from kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + ", using fallback");
-                    }
-                } else {
-                    LOG_ERROR("Failed to send STATUS_REQUEST to kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
-                }
-                
-            } catch (const std::exception& e) {
-                LOG_ERROR("Failed to get real status from kitchen " + 
-                         std::to_string(kitchenProcess->kitchen->getId()) + ": " + e.what());
-            }
-        } else {
-            LOG_WARNING("IPC not ready for kitchen " + std::to_string(kitchenProcess->kitchen->getId()));
+        if (kitchenProcess->active) {
+            displaySingleKitchen(kitchenProcess.get());
         }
-        
-        if (!gotRealStatus) {
-            status.kitchenId = kitchenProcess->kitchen->getId();
-            status.activeCooks = 0;
-            status.totalCooks = _numCooksPerKitchen;
-            status.pizzasInQueue = 0;
-            status.maxCapacity = 2 * _numCooksPerKitchen;
-            status.ingredients = {5, 5, 5, 5, 5, 5, 5, 5, 5};
-        }
-        
-        std::cout << "\nKitchen " << status.kitchenId << " (PID: " << kitchenProcess->pid << "):" << std::endl;
-        std::cout << "  Active cooks: " << status.activeCooks << "/" << status.totalCooks << std::endl;
-        std::cout << "  Pizzas in queue: " << status.pizzasInQueue << "/" << status.maxCapacity << std::endl;
-        std::cout << "  Ingredients: ";
-        
-        const std::vector<std::string> ingredientNames = {
-            "Dough", "Tomato", "Gruyere", "Ham", "Mushrooms", 
-            "Steak", "Eggplant", "GoatCheese", "ChiefLove"
-        };
-        
-        for (size_t i = 0; i < status.ingredients.size() && i < ingredientNames.size(); ++i) {
-            std::cout << ingredientNames[i] << ":" << status.ingredients[i] << " ";
-        }
-        std::cout << std::endl;
+    }
+}
+
+void KitchenManager::displaySingleKitchen(KitchenProcess* kitchenProcess) const {
+    KitchenStatus status = getKitchenStatus(kitchenProcess);
+    displayKitchenInfo(status, kitchenProcess->pid);
+}
+
+KitchenStatus KitchenManager::getKitchenStatus(KitchenProcess* kitchenProcess) const {
+    KitchenStatus status;
+    bool gotRealStatus = false;
+    
+    if (isKitchenReady(kitchenProcess)) {
+        gotRealStatus = requestKitchenStatus(kitchenProcess, status);
     }
     
+    if (!gotRealStatus) {
+        status = createFallbackStatus(kitchenProcess->kitchen->getId());
+    }
+    
+    return status;
+}
+
+bool KitchenManager::requestKitchenStatus(KitchenProcess* kitchenProcess, KitchenStatus& status) const {
+    try {
+        if (!kitchenProcess->ipc->send("STATUS_REQUEST")) {
+            return false;
+        }
+        
+        return waitForStatusResponse(kitchenProcess, status);
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to get status from kitchen " + 
+                 std::to_string(kitchenProcess->kitchen->getId()) + ": " + e.what());
+        return false;
+    }
+}
+
+bool KitchenManager::waitForStatusResponse(KitchenProcess* kitchenProcess, KitchenStatus& status) const {
+    for (int i = 0; i < 50; ++i) {
+        std::string response = receiveKitchenMessage(kitchenProcess);
+        if (!response.empty()) {
+            if (response.substr(0, 7) == "STATUS:") {
+                status.unpack(response.substr(7));
+                return true;
+            } else if (response.substr(0, 10) == "COMPLETED:") {
+                const_cast<KitchenManager*>(this)->handleCompletedPizza(
+                    response.substr(10), kitchenProcess->kitchen->getId());
+            }
+        }
+        Timer::sleep(10);
+    }
+    
+    return false;
+}
+
+KitchenStatus KitchenManager::createFallbackStatus(int kitchenId) const {
+    KitchenStatus status;
+    status.kitchenId = kitchenId;
+    status.activeCooks = 0;
+    status.totalCooks = _numCooksPerKitchen;
+    status.pizzasInQueue = 0;
+    status.maxCapacity = 2 * _numCooksPerKitchen;
+    status.ingredients = {5, 5, 5, 5, 5, 5, 5, 5, 5};
+    return status;
+}
+
+void KitchenManager::displayKitchenInfo(const KitchenStatus& status, pid_t pid) const {
+    std::cout << "\nKitchen " << status.kitchenId << " (PID: " << pid << "):" << std::endl;
+    std::cout << "  Active cooks: " << status.activeCooks << "/" << status.totalCooks << std::endl;
+    std::cout << "  Pizzas in queue: " << status.pizzasInQueue << "/" << status.maxCapacity << std::endl;
+    displayIngredients(status.ingredients);
+}
+
+void KitchenManager::displayIngredients(const std::vector<int>& ingredients) const {
+    std::cout << "  Ingredients: ";
+    
+    const std::vector<std::string> ingredientNames = {
+        "Dough", "Tomato", "Gruyere", "Ham", "Mushrooms", 
+        "Steak", "Eggplant", "GoatCheese", "ChiefLove"
+    };
+    
+    for (size_t i = 0; i < ingredients.size() && i < ingredientNames.size(); ++i) {
+        std::cout << ingredientNames[i] << ":" << ingredients[i] << " ";
+    }
+    std::cout << std::endl;
+}
+
+void KitchenManager::displayStatusFooter() const {
     std::cout << "=====================" << std::endl;
 }
 
@@ -255,13 +380,7 @@ void KitchenManager::cleanup() {
     
     for (auto& kitchenProcess : _kitchens) {
         if (kitchenProcess->active) {
-            kill(kitchenProcess->pid, SIGTERM);
-            
-            int status;
-            waitpid(kitchenProcess->pid, &status, 0);
-            
-            LOG_INFO("Cleaned up kitchen " + 
-                     std::to_string(kitchenProcess->kitchen->getId()));
+            terminateKitchenProcess(kitchenProcess);
         }
     }
     
@@ -279,19 +398,11 @@ int KitchenManager::findBestKitchen() const {
     for (size_t i = 0; i < _kitchens.size(); ++i) {
         const auto& kitchenProcess = _kitchens[i];
         
-        if (!kitchenProcess->active) {
-            continue;
-        }
-        
-        if (!kitchenProcess->kitchen->canAcceptPizza()) {
-            LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + " is at capacity");
+        if (!kitchenProcess->active || !kitchenProcess->kitchen->canAcceptPizza()) {
             continue;
         }
         
         int load = kitchenProcess->kitchen->getPendingPizzaCount();
-        
-        LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + 
-                 " has load: " + std::to_string(load));
         
         if (load < minLoad) {
             minLoad = load;
@@ -301,13 +412,6 @@ int KitchenManager::findBestKitchen() const {
         if (load == 0) {
             break;
         }
-    }
-    
-    if (bestIndex != -1) {
-        LOG_INFO("Selected kitchen " + std::to_string(_kitchens[bestIndex]->kitchen->getId()) + 
-                 " with load " + std::to_string(minLoad));
-    } else {
-        LOG_INFO("No kitchen can accept more pizzas");
     }
     
     return bestIndex;
@@ -321,8 +425,6 @@ void KitchenManager::cleanupDeadKitchens() {
         pid_t result = waitpid(kitchenProcess->pid, &status, WNOHANG);
         
         if (result == kitchenProcess->pid) {
-            LOG_INFO("Kitchen " + std::to_string(kitchenProcess->kitchen->getId()) + 
-                     " process terminated");
             it = _kitchens.erase(it);
         } else {
             ++it;

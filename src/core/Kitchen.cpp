@@ -20,14 +20,7 @@ Kitchen::~Kitchen() {
 
 bool Kitchen::canAcceptPizza() const {
     int totalLoad = static_cast<int>(_pendingPizzas) + static_cast<int>(_activeCooks);
-    bool canAccept = totalLoad < (2 * _numCooks);
-    
-    if (!canAccept) {
-        LOG_INFO("Kitchen " + std::to_string(_id) + " at capacity: " + 
-                 std::to_string(totalLoad) + "/" + std::to_string(2 * _numCooks));
-    }
-    
-    return canAccept;
+    return totalLoad < (2 * _numCooks);
 }
 
 bool Kitchen::addPizza(const SerializedPizza& pizza) {
@@ -39,8 +32,6 @@ bool Kitchen::addPizza(const SerializedPizza& pizza) {
 void Kitchen::start() {
     _active = true;
     _lastActivityTimer.start();
-    LOG_INFO("Kitchen " + std::to_string(_id) + " started with " + 
-             std::to_string(_numCooks) + " cooks");
 }
 
 void Kitchen::stop() {
@@ -65,8 +56,6 @@ void Kitchen::stop() {
     if (_ipc) {
         _ipc->close();
     }
-    
-    LOG_INFO("Kitchen " + std::to_string(_id) + " stopped");
 }
 
 bool Kitchen::isActive() const {
@@ -123,158 +112,149 @@ void Kitchen::setIPC(std::unique_ptr<PipeIPC> ipc) {
 
 void Kitchen::runAsChildProcess() {
     try {
-        LOG_INFO("Kitchen " + std::to_string(_id) + " child process starting");
-        
-        _active = true;
-        _lastActivityTimer.start();
-        
-        initializeIngredients();
-        LOG_INFO("Kitchen " + std::to_string(_id) + " ingredients initialized");
-        
-        try {
-            _restockThread = std::thread(&Kitchen::restockLoop, this);
-            LOG_INFO("Kitchen " + std::to_string(_id) + " restock thread started");
-        } catch (const std::exception& e) {
-            LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to start restock thread: " + e.what());
-        }
-        
-        LOG_INFO("Kitchen " + std::to_string(_id) + " IPC ready: " + (_ipc && _ipc->isReady() ? "YES" : "NO"));
-        
-        int loopCount = 0;
-        int messagesReceived = 0;
-        int lastStatusSent = 0;
-        std::vector<std::thread> cookingThreads;
-        
-        while (_active && loopCount < 10000) {
-            loopCount++;
-            if (loopCount % 50 == 0) {
-                LOG_INFO("Kitchen " + std::to_string(_id) + " main loop iteration " + 
-                         std::to_string(loopCount) + ", messages received: " + std::to_string(messagesReceived));
-            }
-            
-            bool receivedSomething = false;
-            
-            if (_ipc && _ipc->isReady()) {
-                try {
-                    std::string message = _ipc->receive();
-                    if (!message.empty()) {
-                        messagesReceived++;
-                        LOG_INFO("Kitchen " + std::to_string(_id) + " received message #" + 
-                                std::to_string(messagesReceived) + ": " + 
-                                (message.length() > 50 ? message.substr(0, 50) + "..." : message));
-                        
-                        if (message.substr(0, 6) == "PIZZA:") {
-                            try {
-                                SerializedPizza pizza;
-                                pizza.unpack(message.substr(6));
-                                
-                                LOG_INFO("Kitchen " + std::to_string(_id) + " successfully parsed pizza type " + 
-                                         std::to_string(static_cast<int>(pizza.type)));
-                                
-                                {
-                                    ScopedLock lock(_queueMutex);
-                                    _pizzaQueue.push(pizza);
-                                    LOG_INFO("Kitchen " + std::to_string(_id) + " added pizza to queue (size: " + 
-                                             std::to_string(_pizzaQueue.size()) + ")");
-                                }
-                                
-                                updateLastActivity();
-                                receivedSomething = true;
-                                
-                            } catch (const std::exception& e) {
-                                LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to process pizza: " + e.what());
-                            }
-                        } else if (message == "STATUS_REQUEST") {
-                            try {
-                                KitchenStatus status = getStatus();
-                                std::string statusMsg = "STATUS:" + status.pack();
-                                if (_ipc->send(statusMsg)) {
-                                    LOG_INFO("Kitchen " + std::to_string(_id) + " sent status update successfully");
-                                } else {
-                                    LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to send status update");
-                                }
-                                updateLastActivity();
-                                receivedSomething = true;
-                            } catch (const std::exception& e) {
-                                LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to send status: " + e.what());
-                            }
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    if (loopCount % 100 == 0) {
-                        LOG_ERROR("Kitchen " + std::to_string(_id) + " IPC receive error: " + e.what());
-                    }
-                }
-            }
-            
-            while (static_cast<int>(_activeCooks) < _numCooks) {
-                SerializedPizza nextPizza;
-                bool hasPizza = false;
-                
-                {
-                    ScopedLock lock(_queueMutex);
-                    if (!_pizzaQueue.empty()) {
-                        nextPizza = _pizzaQueue.front();
-                        hasPizza = true;
-                    }
-                }
-                
-                if (hasPizza) {
-                    cookingThreads.emplace_back([this, nextPizza]() {
-                        this->cookPizza(nextPizza);
-                    });
-                    cookingThreads.back().detach();
-                    LOG_INFO("Kitchen " + std::to_string(_id) + " started cooking thread for queued pizza");
-                } else {
-                    break;
-                }
-            }
-            
-            if (loopCount % 100 == 0 && loopCount > lastStatusSent + 50) {
-                try {
-                    if (_ipc && _ipc->isReady()) {
-                        KitchenStatus status = getStatus();
-                        std::string statusMsg = "STATUS:" + status.pack();
-                        _ipc->send(statusMsg);
-                        lastStatusSent = loopCount;
-                        LOG_INFO("Kitchen " + std::to_string(_id) + " sent periodic status update");
-                    }
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to send periodic status: " + e.what());
-                }
-            }
-            
-            if (!receivedSomething && shouldClose()) {
-                LOG_INFO("Kitchen " + std::to_string(_id) + " closing due to inactivity");
-                break;
-            }
-            
-            Timer::sleep(receivedSomething ? 10 : 100);
-        }
-        
-        if (loopCount >= 10000) {
-            LOG_WARNING("Kitchen " + std::to_string(_id) + " reached loop limit, exiting");
-        }
-        
-        _active = false;
-        LOG_INFO("Kitchen " + std::to_string(_id) + " starting cleanup");
-        
-        if (_restockThread.joinable()) {
-            LOG_INFO("Kitchen " + std::to_string(_id) + " joining restock thread");
-            _restockThread.join();
-        }
-        
-        if (_ipc) {
-            LOG_INFO("Kitchen " + std::to_string(_id) + " closing IPC");
-            _ipc->close();
-        }
-        
-        LOG_INFO("Kitchen " + std::to_string(_id) + " child process exiting cleanly");
+        initializeKitchenProcess();
+        startRestockThread();
+        runMainProcessLoop();
+        cleanupKitchenProcess();
         
     } catch (const std::exception& e) {
         LOG_ERROR("Kitchen " + std::to_string(_id) + " error: " + e.what());
-    } catch (...) {
-        LOG_ERROR("Kitchen " + std::to_string(_id) + " unknown error");
+    }
+}
+
+void Kitchen::initializeKitchenProcess() {
+    _active = true;
+    _lastActivityTimer.start();
+    initializeIngredients();
+}
+
+void Kitchen::startRestockThread() {
+    try {
+        _restockThread = std::thread(&Kitchen::restockLoop, this);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to start restock thread: " + e.what());
+    }
+}
+
+void Kitchen::runMainProcessLoop() {
+    int loopCount = 0;
+    
+    while (_active && loopCount < 10000) {
+        loopCount++;
+        
+        bool receivedSomething = processIncomingMessages();
+        processPizzaQueue();
+        sendPeriodicStatus(loopCount);
+        
+        if (!receivedSomething && shouldClose()) {
+            break;
+        }
+        
+        Timer::sleep(receivedSomething ? 10 : 100);
+    }
+}
+
+bool Kitchen::processIncomingMessages() {
+    bool receivedSomething = false;
+    
+    if (_ipc && _ipc->isReady()) {
+        try {
+            std::string message = _ipc->receive();
+            if (!message.empty()) {
+                if (handlePizzaMessage(message) || handleStatusMessage(message)) {
+                    receivedSomething = true;
+                    updateLastActivity();
+                }
+            }
+        } catch (const std::exception& e) {
+        }
+    }
+    
+    return receivedSomething;
+}
+
+bool Kitchen::handlePizzaMessage(const std::string& message) {
+    if (message.substr(0, 6) == "PIZZA:") {
+        try {
+            SerializedPizza pizza;
+            pizza.unpack(message.substr(6));
+            
+            {
+                ScopedLock lock(_queueMutex);
+                _pizzaQueue.push(pizza);
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to process pizza: " + e.what());
+        }
+    }
+    return false;
+}
+
+bool Kitchen::handleStatusMessage(const std::string& message) {
+    if (message == "STATUS_REQUEST") {
+        try {
+            KitchenStatus status = getStatus();
+            std::string statusMsg = "STATUS:" + status.pack();
+            return _ipc->send(statusMsg);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Kitchen " + std::to_string(_id) + " failed to send status: " + e.what());
+        }
+    }
+    return false;
+}
+
+void Kitchen::processPizzaQueue() {
+    while (static_cast<int>(_activeCooks) < _numCooks) {
+        SerializedPizza nextPizza;
+        bool hasPizza = false;
+        
+        {
+            ScopedLock lock(_queueMutex);
+            if (!_pizzaQueue.empty()) {
+                nextPizza = _pizzaQueue.front();
+                _pizzaQueue.pop();
+                hasPizza = true;
+            }
+        }
+        
+        if (hasPizza) {
+            std::thread cookingThread([this, nextPizza]() {
+                this->cookPizza(nextPizza);
+            });
+            cookingThread.detach();
+        } else {
+            break;
+        }
+    }
+}
+
+void Kitchen::sendPeriodicStatus(int loopCount) {
+    static int lastStatusSent = 0;
+    
+    if (loopCount % 100 == 0 && loopCount > lastStatusSent + 50) {
+        try {
+            if (_ipc && _ipc->isReady()) {
+                KitchenStatus status = getStatus();
+                std::string statusMsg = "STATUS:" + status.pack();
+                _ipc->send(statusMsg);
+                lastStatusSent = loopCount;
+            }
+        } catch (const std::exception& e) {
+        }
+    }
+}
+
+void Kitchen::cleanupKitchenProcess() {
+    _active = false;
+    
+    if (_restockThread.joinable()) {
+        _restockThread.join();
+    }
+    
+    if (_ipc) {
+        _ipc->close();
     }
 }
 
@@ -283,52 +263,27 @@ void Kitchen::cookPizza(const SerializedPizza& pizza) {
     decrementPendingPizzas();
     updateLastActivity();
     
-    LOG_INFO("Kitchen " + std::to_string(_id) + " cook started preparing pizza type " + 
-             std::to_string(static_cast<int>(pizza.type)) + 
-             " (active cooks: " + std::to_string(static_cast<int>(_activeCooks)) + ")");
-    
     if (!hasIngredients(pizza)) {
-        LOG_WARNING("Kitchen " + std::to_string(_id) + " missing ingredients for pizza type " + 
-                    std::to_string(static_cast<int>(pizza.type)));
-        
-        {
-            ScopedLock lock(_queueMutex);
-            if (!_pizzaQueue.empty()) {
-                _pizzaQueue.pop();
-                LOG_INFO("Kitchen " + std::to_string(_id) + " removed pizza from queue due to missing ingredients (remaining: " + 
-                         std::to_string(_pizzaQueue.size()) + ")");
-            }
-        }
-        
+        removePizzaFromQueue();
         _activeCooks--;
         return;
     }
     
     consumeIngredients(pizza);
     
-    LOG_INFO("Kitchen " + std::to_string(_id) + " cooking pizza type " + 
-             std::to_string(static_cast<int>(pizza.type)) + " for " + 
-             std::to_string(pizza.cookingTime) + "ms");
-    
     Timer::sleep(pizza.cookingTime);
     
-    {
-        ScopedLock lock(_queueMutex);
-        if (!_pizzaQueue.empty()) {
-            _pizzaQueue.pop();
-            LOG_INFO("Kitchen " + std::to_string(_id) + " removed cooked pizza from queue (remaining: " + 
-                     std::to_string(_pizzaQueue.size()) + ")");
-        }
-    }
+    removePizzaFromQueue();
     
-    LOG_INFO("Kitchen " + std::to_string(_id) + " finished cooking pizza type " + 
-             std::to_string(static_cast<int>(pizza.type)) + " - PIZZA READY!");
+    std::string pizzaInfo = PizzaTypeHelper::pizzaTypeToString(pizza.type) + " " +
+                           PizzaTypeHelper::pizzaSizeToString(pizza.size);
     
     if (_ipc && _ipc->isReady()) {
         SerializedPizza readyPizza = pizza;
         readyPizza.isCooked = true;
         try {
-            *_ipc << readyPizza;
+            std::string completedMsg = "COMPLETED:" + readyPizza.pack();
+            _ipc->send(completedMsg);
         } catch (const std::exception& e) {
             LOG_ERROR("Kitchen " + std::to_string(_id) + " IPC error: " + e.what());
         }
@@ -336,10 +291,13 @@ void Kitchen::cookPizza(const SerializedPizza& pizza) {
     
     _activeCooks--;
     updateLastActivity();
-    
-    LOG_INFO("Kitchen " + std::to_string(_id) + " cook finished (active cooks: " + 
-             std::to_string(static_cast<int>(_activeCooks)) + 
-             ", pending: " + std::to_string(static_cast<int>(_pendingPizzas)) + ")");
+}
+
+void Kitchen::removePizzaFromQueue() {
+    ScopedLock lock(_queueMutex);
+    if (!_pizzaQueue.empty()) {
+        _pizzaQueue.pop();
+    }
 }
 
 void Kitchen::restockIngredients() {
@@ -348,8 +306,6 @@ void Kitchen::restockIngredients() {
     for (auto& ingredient : _ingredients) {
         ingredient.second = std::min(ingredient.second + 1, 10);
     }
-    
-    LOG_DEBUG("Kitchen " + std::to_string(_id) + " restocked ingredients");
 }
 
 void Kitchen::communicateWithReception() {
@@ -419,18 +375,15 @@ void Kitchen::restockLoop() {
 }
 
 void Kitchen::decrementQueueSize() {
-
 }
 
 void Kitchen::incrementPendingPizzas() {
     _pendingPizzas++;
-    LOG_INFO("Kitchen " + std::to_string(_id) + " pending pizzas: " + std::to_string(static_cast<int>(_pendingPizzas)));
 }
 
 void Kitchen::decrementPendingPizzas() {
     if (_pendingPizzas > 0) {
         _pendingPizzas--;
-        LOG_INFO("Kitchen " + std::to_string(_id) + " pending pizzas: " + std::to_string(static_cast<int>(_pendingPizzas)));
     }
 }
 
